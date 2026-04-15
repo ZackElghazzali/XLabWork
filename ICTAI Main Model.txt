@@ -1,0 +1,1905 @@
+import os
+import gc
+import numpy as np
+import pandas as pd
+import nibabel as nib
+import tensorflow as tf
+import json                           # ADDED
+import time                           # ADDED
+from datetime import datetime         # ADDED
+import matplotlib.pyplot as plt       # ADDED
+import seaborn as sns                 # ADDED
+# TensorFlow and Keras imports
+from tensorflow.keras import mixed_precision
+#policy = mixed_precision.Policy('mixed_float16')
+#mixed_precision.set_global_policy(policy)
+policy = mixed_precision.Policy('float32')
+mixed_precision.set_global_policy(policy)
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    Input, Conv3D, MaxPooling3D, Flatten, Dense, Dropout,
+    Concatenate, BatchNormalization, GlobalAveragePooling1D,
+    Reshape, MultiHeadAttention, Add, LayerNormalization, Layer
+)
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.utils import Sequence
+from tensorflow.keras.callbacks import EarlyStopping, LearningRateScheduler
+from tensorflow.keras.metrics import Metric
+from tensorflow.keras.initializers import RandomNormal
+
+# Sklearn imports
+from sklearn.model_selection import train_test_split, GroupShuffleSplit
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    matthews_corrcoef,
+    f1_score,
+    roc_auc_score,
+    classification_report,
+    accuracy_score,              # ADDED
+    confusion_matrix,            # ADDED
+    cohen_kappa_score           # ADDED
+)
+
+# SciPy imports
+from scipy.ndimage import zoom, rotate, gaussian_filter, map_coordinates
+
+# TensorFlow optimization
+import tensorflow_model_optimization as tfmot
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Currently, memory growth needs to be the same across GPUs
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        logical_gpus = tf.config.list_logical_devices('GPU')
+        print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+    except RuntimeError as e:
+        # Memory growth must be set before GPUs have been initialized
+        print(e)
+
+
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+os.environ['TF_GPU_THREAD_COUNT'] = '4'
+os.environ['TF_NUM_INTEROP_THREADS'] = '8'
+os.environ['TF_NUM_INTRAOP_THREADS'] = '8'
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+os.environ['TF_FORCE_GPU_ALLOW_GROWTH'] = 'true'
+os.environ['TF_GPU_THREAD_MODE'] = 'gpu_private'
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+            tf.config.experimental.set_virtual_device_configuration(
+                gpu,
+                [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=6144)] # Limit to 6GB
+            )
+    except RuntimeError as e:
+        print(e)
+
+# ADD this new, consolidated configuration block right after the initial imports.
+
+import os
+import gc
+import numpy as np
+import pandas as pd
+# ... other imports
+
+# --- PHASE 1: CONSOLIDATED ENVIRONMENT CONFIGURATION ---
+
+# Reasoning: Set environment variables BEFORE importing TensorFlow.
+# 'cuda_malloc_async' can improve performance by reducing memory allocation overhead.
+# [cite_start]The previous advice to remove this was incorrect[cite: 2]; it's often beneficial.
+os.environ['TF_GPU_ALLOCATOR'] = 'cuda_malloc_async'
+
+import tensorflow as tf
+
+# Reasoning: This unified block configures GPUs, mixed precision, and strategy in one place.
+# 1. GPU Memory Growth: Prevents TensorFlow from allocating all GPU memory at once. [cite_start]This is a critical best practice[cite: 6].
+# [cite_start]2. Mixed Precision: Uses float16 for computations where possible, which significantly speeds up training on compatible (Tensor Core) GPUs and reduces memory usage[cite: 6].
+# 3. MirroredStrategy: Ensures the model and training are distributed across all available GPUs.
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"Initialized {len(gpus)} Physical GPUs with Memory Growth.")
+    except RuntimeError as e:
+        print(f"Error during GPU initialization: {e}")
+
+# [cite_start]Set mixed precision policy for performance gain [cite: 6]
+policy = tf.keras.mixed_precision.Policy('mixed_float16')
+tf.keras.mixed_precision.set_global_policy(policy)
+
+# Set up distributed strategy
+strategy = tf.distribute.MirroredStrategy()
+print(f'Number of devices for MirroredStrategy: {strategy.num_replicas_in_sync}')
+
+# --- END OF PHASE 1 ---
+
+print(tf.__version__)
+# Data processing
+#---------------------------
+# Load cognitive score CSVs
+CSV_PATH_CDRSB = "/projects/bcqx/zelghazzali/image/CDRSB.csv"
+CSV_PATH_MMSE = "/projects/bcqx/zelghazzali/image/MMSE.csv"
+
+df_cdrsb = pd.read_csv(CSV_PATH_CDRSB)
+df_mmse = pd.read_csv(CSV_PATH_MMSE)
+
+# Standardize identifiers in score files
+df_cdrsb['Subject'] = df_cdrsb['PTID'].astype(str).str.strip()
+df_cdrsb['Visit'] = df_cdrsb['VISCODE2'].astype(str).str.strip()
+
+df_mmse['Subject'] = df_mmse['PTID'].astype(str).str.strip()  
+df_mmse['Visit'] = df_mmse['VISCODE2'].astype(str).str.strip()
+
+# MRI Data Processing
+CSV_PATH_MRI = "/projects/bcqx/zelghazzali/image/mri_common.csv"
+IMAGING_ROOT_MRI = "/projects/bcqx/zelghazzali/image/MRI"
+
+# PET Data Processing
+CSV_PATH_PET = "/projects/bcqx/zelghazzali/image/pet_common.csv"
+IMAGING_ROOT_PET = "/projects/bcqx/zelghazzali/image/PET"
+
+def create_adjacent_visit_dataset(df_mri, df_pet, df_cdrsb, df_mmse, max_visit_gap=2):
+    print(f"Creating dataset with adjacent visits (max gap: {max_visit_gap})")
+    visit_order = {
+        # ADNI1 visits
+        'sc': 0, 'bl': 1, 'm06': 2, 'm12': 3, 'm18': 4, 'm24': 5, 'm36': 6, 'm48': 7,
+        # ADNIGO visits  
+        'scmri': 0.5, 'm03': 1.5, 'm60': 10, 'm72': 12,
+        # ADNI2 visits
+        'v01': 0, 'v02': 0.5, 'v03': 1, 'v04': 1.5, 'v05': 2, 'v06': 2.5, 
+        'v11': 3, 'v21': 4, 'v31': 5, 'v41': 6, 'v51': 7,
+        # ADNI3 visits
+        'init': 0.5, 'y1': 1, 'y2': 2, 'y3': 3, 'y4': 4, 'y5': 5, 'y6': 6,
+        # ADNI4 visits
+        '4_sc': 0, '4_bl': 1, '4_init': 0.5, '4_m12': 3, '4_m24': 5, '4_m36': 7,
+        # Special visits
+        'f': 0.25, 'uns1': 999, 'nv': 999, 'tau': 999
+    }
+
+    def get_visit_numeric(visit_code):
+        if pd.isna(visit_code):
+            return 999
+        return visit_order.get(str(visit_code).lower(),999)
+
+    for df, name in [(df_mri, 'MRI'), (df_pet, 'PET'), (df_cdrsb, 'CDRSB'), (df_mmse, 'MMSE')]:
+        df['Visit_Numeric'] = df['Visit'].apply(get_visit_numeric)
+        valid_visits = df[df['Visit_Numeric'] != 999]
+        if len(valid_visits) > 0:
+            print(f"{name} visit range: {valid_visits['Visit_Numeric'].min():.1f} - {valid_visits['Visit_Numeric'].max():.1f}")
+
+    common_subjects = set(df_mri['Subject']).intersection(
+        set(df_pet['Subject']),
+        set(df_cdrsb['Subject']),
+        set(df_mmse['Subject'])
+    )
+    print(f"Common subjects across all modalities: {len(common_subjects)}")
+    if len(common_subjects) == 0:
+        print("ERROR: No common subjects found. Check subject ID formatting.")
+        return pd.DataFrame()
+    
+    # Create adjacent visit dataset
+    enhanced_df = []
+    
+    for subject in common_subjects:
+        subject_mri = df_mri[df_mri['Subject'] == subject].sort_values('Visit_Numeric')
+        subject_pet = df_pet[df_pet['Subject'] == subject].sort_values('Visit_Numeric')
+        subject_cdrsb = df_cdrsb[df_cdrsb['Subject'] == subject].sort_values('Visit_Numeric')
+        subject_mmse = df_mmse[df_mmse['Subject'] == subject].sort_values('Visit_Numeric')
+        
+        if subject_mri.empty or subject_pet.empty:
+            continue
+            
+        # Find MRI-PET pairs within visit gap
+        for _, mri_row in subject_mri.iterrows():
+            mri_visit_num = mri_row['Visit_Numeric']
+            
+            if mri_visit_num == 999:  # Skip invalid visits
+                continue
+                
+            # Find PET visits within acceptable range
+            pet_candidates = subject_pet[
+                (abs(subject_pet['Visit_Numeric'] - mri_visit_num) <= max_visit_gap) &
+                (subject_pet['Visit_Numeric'] != 999)
+            ]
+            
+            if pet_candidates.empty:
+                continue
+                
+            # Use closest PET visit
+            pet_distances = abs(pet_candidates['Visit_Numeric'] - mri_visit_num)
+            closest_pet_idx = pet_distances.idxmin()
+            pet_row = subject_pet.loc[closest_pet_idx]
+            
+            # Find closest cognitive scores
+            cdrsb_candidates = subject_cdrsb[
+                (abs(subject_cdrsb['Visit_Numeric'] - mri_visit_num) <= max_visit_gap) &
+                (subject_cdrsb['Visit_Numeric'] != 999)
+            ]
+            mmse_candidates = subject_mmse[
+                (abs(subject_mmse['Visit_Numeric'] - mri_visit_num) <= max_visit_gap) &
+                (subject_mmse['Visit_Numeric'] != 999)
+            ]
+            
+            if cdrsb_candidates.empty and mmse_candidates.empty:
+                continue
+                
+            # Combine data
+            combined_row = {
+                'Subject': subject,
+                'Visit': mri_row['Visit'],  # Use MRI visit as primary
+                'Group': mri_row['Group'],
+                'Image_Path_MRI': mri_row['Image_Path_MRI'],
+                'Image_Path_PET': pet_row['Image_Path_PET'],
+                'MRI_Visit_Numeric': mri_visit_num,
+                'PET_Visit_Numeric': pet_row['Visit_Numeric'],
+            }
+            
+            # Add closest CDRSB score
+            if not cdrsb_candidates.empty:
+                cdrsb_distances = abs(cdrsb_candidates['Visit_Numeric'] - mri_visit_num)
+                closest_cdrsb_idx = cdrsb_distances.idxmin()
+                cdrsb_data = subject_cdrsb.loc[closest_cdrsb_idx]
+                combined_row['CDRSB'] = cdrsb_data['CDRSB']
+                combined_row['CDRSB_Visit'] = cdrsb_data['Visit']
+            
+            # Add closest MMSE score
+            if not mmse_candidates.empty:
+                mmse_distances = abs(mmse_candidates['Visit_Numeric'] - mri_visit_num)
+                closest_mmse_idx = mmse_distances.idxmin()
+                mmse_data = subject_mmse.loc[closest_mmse_idx]
+                combined_row['MMSCORE'] = mmse_data['MMSCORE']
+                combined_row['MMSE_Visit'] = mmse_data['Visit']
+            
+            enhanced_df.append(combined_row)
+    
+    if enhanced_df:
+        result_df = pd.DataFrame(enhanced_df)
+        
+        # Remove duplicates
+        result_df = result_df.drop_duplicates(subset=['Subject', 'Visit'])
+        
+        print(f"\n=== Final Dataset Statistics ===")
+        print(f"Final dataset size: {len(result_df)}")
+        print("Class distribution:")
+        print(result_df['Group'].value_counts())
+        
+        return result_df
+    else:
+        print("No adjacent visit matches found.")
+        return pd.DataFrame()
+
+def build_mri_path(row, mri_root):
+    subj = row["Subject"]
+    img  = row["Image Data ID"]
+    return os.path.join(mri_root, str(subj), f"{img}.nii")
+
+
+def build_pet_path(row, pet_root):
+    subj = row["Subject"]
+    img = row["Image Data ID"]
+    return os.path.join(
+        pet_root,
+        str(subj),
+
+        str(img),               # folder named after Image Data ID
+        f"{img}_avg.nii"       # avg file inside that folder
+    )
+
+# Load CSVs
+df_mri = pd.read_csv(CSV_PATH_MRI)
+df_pet = pd.read_csv(CSV_PATH_PET)
+
+# Convert to string and strip whitespace
+for df in [df_mri, df_pet]:
+    df['Subject'] = df['Subject'].astype(str).str.strip()
+    df['Image Data ID'] = df['Image Data ID'].astype(str).str.strip()
+
+# Create imaging paths
+df_mri["Image_Path_MRI"] = df_mri.apply(lambda row: build_mri_path(row, IMAGING_ROOT_MRI), axis=1)
+df_pet["Image_Path_PET"] = df_pet.apply(lambda row: build_pet_path(row, IMAGING_ROOT_PET), axis=1)
+
+def enhance_data_quality(df_combined):
+    print("=== Data Quality Enhancement (DISABLED FOR DEBUGGING) ===")
+    print(f"Keeping all {len(df_combined)} samples")
+    return df_combined
+
+
+print("=== Creating Adjacent Visit Dataset ===")
+df_combined = create_adjacent_visit_dataset(df_mri, df_pet, df_cdrsb, df_mmse, max_visit_gap=2)
+df_combined = enhance_data_quality(df_combined)
+
+if df_combined.empty:
+    print("ERROR: No data after adjacent visit matching. Check data formatting or increase max_visit_gap.")
+    exit(1)
+
+# Continue with existing file existence check (keep this line):
+def files_exist(row):
+    return os.path.exists(row["Image_Path_MRI"]) and os.path.exists(row["Image_Path_PET"])
+
+
+# Show final visit distribution
+print(f"\nFinal visit distribution:")
+print(df_combined['Visit'].value_counts().sort_index())
+
+def files_exist(row):
+    return os.path.exists(row["Image_Path_MRI"]) and os.path.exists(row["Image_Path_PET"])
+
+df_combined = df_combined[df_combined.apply(files_exist, axis=1)].reset_index(drop=True)
+
+# ADD THIS LINE - Save df_combined to CSV for preprocessing script
+df_combined.to_csv("/projects/bcqx/zelghazzali/image/df_combined_original.csv", index=False)
+print(f"Saved df_combined with {len(df_combined)} samples to df_combined_original.csv")
+
+print("\n=== Data Validation ===")
+assert not df_combined["Group"].isnull().any(), "Missing class labels"
+assert len(df_combined["Group"].unique()) == 3, "Should have 3 classes"
+
+
+# Check first sample's normalization
+sample_mri = nib.load(df_combined["Image_Path_MRI"].iloc[0]).get_fdata()
+sample_pet = nib.load(df_combined["Image_Path_PET"].iloc[0]).get_fdata()
+print(f"MRI pre-normalization range: {sample_mri.min():.2f}-{sample_mri.max():.2f}")
+print(f"PET pre-normalization range: {sample_pet.min():.2f}-{sample_pet.max():.2f}")
+
+PREPROCESSED_CSV_PATH = "/projects/bcqx/zelghazzali/image/df_combined.csv"
+df_preprocessed = pd.read_csv(PREPROCESSED_CSV_PATH)
+
+# Initialize the one-hot encoder
+encoder = OneHotEncoder(sparse_output=False)
+encoder.fit(df_preprocessed["Group"].values.reshape(-1, 1))
+
+# Ensuring that no patient (Subject) appears in more than one split, to avoid confusion for patients with multiple scans
+# 70% train, 30% temp (val + test)
+gss1 = GroupShuffleSplit(n_splits=1, test_size=0.3, random_state=42)
+train_inds, temp_inds = next(gss1.split(df_preprocessed, groups=df_preprocessed["Subject"]))
+train_df = df_preprocessed.iloc[train_inds]
+temp_df = df_preprocessed.iloc[temp_inds]
+
+# Class imbalance handling
+class_counts = train_df["Group"].value_counts()
+total = sum(class_counts)
+class_weights = {i: total/(len(class_counts)*count) for i, count in enumerate(class_counts)}
+
+print("Class weights:", class_weights)
+
+# 50% val, 50% test from the temp set
+gss2 = GroupShuffleSplit(n_splits=1, test_size=0.5, random_state=42)
+val_inds, test_inds = next(gss2.split(temp_df, groups=temp_df["Subject"]))
+val_df = temp_df.iloc[val_inds]
+test_df = temp_df.iloc[test_inds]
+
+print("\n=== Class Distribution ===")
+print("Train:", train_df["Group"].value_counts())
+print("Val:", val_df["Group"].value_counts())
+print("Test:", test_df["Group"].value_counts())
+
+class_counts = train_df["Group"].value_counts()
+total = sum(class_counts)
+class_weights = {i: total/(len(class_counts)*count) for i, count in enumerate(class_counts)}
+print("\nClass weights:", class_weights)
+
+# Removed the Tabular branch for the time being, hence the class name change.
+
+def create_tf_dataset(generator):
+    """Create properly repeating dataset"""
+    dataset = tf.data.Dataset.from_generator(
+        lambda: generator,
+        output_signature=(
+            (
+                tf.TensorSpec(shape=(None, 64, 128, 128, 1), dtype=tf.float32),
+                tf.TensorSpec(shape=(None, 64, 128, 128, 1), dtype=tf.float32)
+            ),
+            tf.TensorSpec(shape=(None, 3), dtype=tf.float32)
+        )
+    )
+    return dataset.repeat().cache().prefetch(tf.data.AUTOTUNE)  # Added .repeat()
+
+# --- PHASE 3: EFFICIENT TF.DATA INPUT PIPELINE ---
+
+# Reasoning: This function uses tf.data.Dataset.from_tensor_slices, which is highly efficient for
+# creating a dataset from in-memory lists of file paths and labels. This is the recommended
+# [cite_start]approach for performance[cite: 2].
+def create_dataset(df, batch_size, encoder, shuffle=True):
+    # Get file paths from the pre-processed dataframe
+    mri_paths = df['Preprocessed_Path_MRI'].values
+    pet_paths = df['Preprocessed_Path_PET'].values
+    
+    # One-hot encode labels
+    labels = encoder.transform(df["Group"].values.reshape(-1, 1))
+
+    def load_scans(mri_path, pet_path):
+        def load_both_files(mri_p, pet_p):
+            # Convert tensors to strings and load files
+            mri_str = mri_p.numpy().decode('utf-8')
+            pet_str = pet_p.numpy().decode('utf-8')
+            
+            mri_data = np.load(mri_str)
+            pet_data = np.load(pet_str)
+            
+            return mri_data.astype(np.float32), pet_data.astype(np.float32)
+        
+        mri, pet = tf.py_function(
+            load_both_files, 
+            [mri_path, pet_path], 
+            [tf.float32, tf.float32]
+        )
+        
+        mri.set_shape([64, 128, 128, 1])
+        pet.set_shape([64, 128, 128, 1])
+        return (mri, pet)
+
+    # Rest of your function remains the same...
+    path_ds = tf.data.Dataset.from_tensor_slices((mri_paths, pet_paths))
+    image_ds = path_ds.map(load_scans, num_parallel_calls=tf.data.AUTOTUNE)
+    label_ds = tf.data.Dataset.from_tensor_slices(labels)
+    dataset = tf.data.Dataset.zip((image_ds, label_ds))
+    
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=2048)
+    
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(buffer_size=tf.data.AUTOTUNE)
+    
+    return dataset
+
+# --- END OF PHASE 3 ---
+
+class BalancedAccuracy(tf.keras.metrics.Metric):
+    def __init__(self, name='balanced_acc', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.total = self.add_weight(name='total', initializer='zeros')
+        self.count = self.add_weight(name='count', initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_pred = tf.argmax(y_pred, axis=1)
+        y_true = tf.argmax(y_true, axis=1)
+        matches = tf.equal(y_true, y_pred)
+        self.total.assign_add(tf.reduce_sum(tf.cast(matches, tf.float32)))
+        self.count.assign_add(tf.cast(tf.size(y_true), tf.float32))
+
+    def result(self):
+        return self.total / self.count
+
+    def reset_state(self):
+        self.total.assign(0)
+        self.count.assign(0)
+
+class MCC(tf.keras.metrics.Metric):
+    def __init__(self, name='mcc', **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.true_positives = self.add_weight(name='tp', initializer='zeros')
+        self.true_negatives = self.add_weight(name='tn', initializer='zeros')
+        self.false_positives = self.add_weight(name='fp', initializer='zeros')
+        self.false_negatives = self.add_weight(name='fn', initializer='zeros')
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_pred = tf.argmax(y_pred, axis=1)
+        y_true = tf.argmax(y_true, axis=1)
+        
+        # Vectorized calculation using confusion matrix
+        conf_matrix = tf.math.confusion_matrix(y_true, y_pred, num_classes=3)
+        
+        # Sum over all classes
+        self.true_positives.assign_add(tf.reduce_sum(tf.linalg.diag_part(conf_matrix)))
+        self.false_positives.assign_add(tf.reduce_sum(conf_matrix, axis=0) - tf.linalg.diag_part(conf_matrix))
+        self.false_negatives.assign_add(tf.reduce_sum(conf_matrix, axis=1) - tf.linalg.diag_part(conf_matrix))
+        self.true_negatives.assign_add(
+            tf.reduce_sum(conf_matrix) - 
+            (self.true_positives + self.false_positives + self.false_negatives)
+        )
+
+    def result(self):
+        numerator = (self.true_positives * self.true_negatives - 
+                    self.false_positives * self.false_negatives)
+        denominator = tf.sqrt(
+            (self.true_positives + self.false_positives) *
+            (self.true_positives + self.false_negatives) *
+            (self.true_negatives + self.false_positives) *
+            (self.true_negatives + self.false_negatives)
+        )
+        return numerator / (denominator + tf.keras.backend.epsilon())
+
+    def reset_state(self):
+        self.true_positives.assign(0)
+        self.true_negatives.assign(0)
+        self.false_positives.assign(0)
+        self.false_negatives.assign(0)
+
+val_df = val_df.groupby('Subject', group_keys=False).apply(
+    lambda x: x.sample(frac=1, random_state=42)
+).reset_index(drop=True)
+
+class CrossModalAttentionFusion(Layer):
+    """
+    Advanced cross-modal attention fusion for MRI-PET integration
+    Based on recent medical imaging fusion research
+    """
+    def __init__(self, d_model=128, num_heads=4, **kwargs):
+        super().__init__(**kwargs)
+        self.d_model = d_model
+        self.num_heads = num_heads
+        
+        # Cross-attention layers
+        self.mri_to_pet_attention = MultiHeadAttention(
+            num_heads=num_heads, key_dim=d_model//num_heads, dropout=0.1
+        )
+        self.pet_to_mri_attention = MultiHeadAttention(
+            num_heads=num_heads, key_dim=d_model//num_heads, dropout=0.1
+        )
+        
+        # Self-attention for each modality
+        self.mri_self_attention = MultiHeadAttention(
+            num_heads=num_heads, key_dim=d_model//num_heads, dropout=0.1
+        )
+        self.pet_self_attention = MultiHeadAttention(
+            num_heads=num_heads, key_dim=d_model//num_heads, dropout=0.1
+        )
+        
+        # Modality-specific projections
+        self.mri_projection = Dense(d_model)
+        self.pet_projection = Dense(d_model)
+        
+        # Fusion layers
+        self.fusion_gate = Dense(d_model, activation='sigmoid')
+        self.fusion_projection = Dense(d_model)
+        
+        # Normalization layers
+        self.norm1 = LayerNormalization()
+        self.norm2 = LayerNormalization()
+        self.norm3 = LayerNormalization()
+        
+    def call(self, inputs):
+        mri_features, pet_features = inputs
+        
+        # Project to same dimension
+        mri_proj = self.mri_projection(mri_features)
+        pet_proj = self.pet_projection(pet_features)
+        
+        # Self-attention within each modality
+        mri_self = self.mri_self_attention(mri_proj, mri_proj)
+        pet_self = self.pet_self_attention(pet_proj, pet_proj)
+        
+        # Add residual connections
+        mri_self = self.norm1(mri_self + mri_proj)
+        pet_self = self.norm1(pet_self + pet_proj)
+        
+        # Cross-modal attention
+        mri_to_pet = self.mri_to_pet_attention(mri_self, pet_self)
+        pet_to_mri = self.pet_to_mri_attention(pet_self, mri_self)
+        
+        # Enhanced features with cross-modal information
+        enhanced_mri = self.norm2(mri_to_pet + mri_self)
+        enhanced_pet = self.norm2(pet_to_mri + pet_self)
+        
+        # Adaptive fusion with learned gates
+        fusion_weight = self.fusion_gate(enhanced_mri + enhanced_pet)
+        fused_features = fusion_weight * enhanced_mri + (1 - fusion_weight) * enhanced_pet
+        
+        # Final projection
+        output = self.fusion_projection(fused_features)
+        output = self.norm3(output + enhanced_mri + enhanced_pet)  # Triple residual
+        
+        return output
+
+class MedicalContrastiveLoss(tf.keras.losses.Loss):
+    """
+    Contrastive loss for self-supervised medical imaging pre-training
+    Learns to distinguish between different brain regions and pathologies
+    """
+    def __init__(self, temperature=0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.temperature = temperature
+    
+    def call(self, y_true, y_pred):
+        # y_pred contains [features1, features2] from augmented pairs
+        features1, features2 = tf.split(y_pred, 2, axis=1)
+        
+        # Normalize features
+        features1 = tf.nn.l2_normalize(features1, axis=1)
+        features2 = tf.nn.l2_normalize(features2, axis=1)
+        
+        batch_size = tf.shape(features1)[0]
+        
+        # Compute similarity matrix
+        similarity_matrix = tf.matmul(features1, features2, transpose_b=True) / self.temperature
+        
+        # Create positive mask (diagonal elements)
+        positive_mask = tf.eye(batch_size)
+        
+        # Compute loss
+        logits = similarity_matrix
+        labels = positive_mask
+        
+        loss = tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=logits)
+        return tf.reduce_mean(loss)
+
+def create_self_supervised_model(base_model):
+    """Create self-supervised pre-training model"""
+    # Freeze base layers initially
+    for layer in base_model.layers[:-3]:
+        layer.trainable = False
+    
+    # Add projection head for contrastive learning
+    features = base_model.layers[-2].output  # Before final classification
+    projection = Dense(256, activation='relu', name='ssl_projection1')(features)
+    projection = Dropout(0.3)(projection)
+    projection = Dense(128, activation='relu', name='ssl_projection2')(projection)
+    projection = tf.nn.l2_normalize(projection, axis=1)
+    
+    ssl_model = Model(inputs=base_model.input, outputs=projection)
+    return ssl_model
+
+class ProgressiveTrainingScheduler(tf.keras.callbacks.Callback):
+    """
+    Progressive training scheduler for medical imaging
+    Gradually increases model complexity and data difficulty
+    """
+    def __init__(self, model, phases=None):
+        super().__init__()
+        self.phases = phases or [
+            {'epochs': 10, 'freeze_layers': 15, 'lr_multiplier': 1.0, 'augmentation_prob': 0.3},
+            {'epochs': 15, 'freeze_layers': 10, 'lr_multiplier': 0.5, 'augmentation_prob': 0.5},
+            {'epochs': 20, 'freeze_layers': 0, 'lr_multiplier': 0.1, 'augmentation_prob': 0.7}
+        ]
+        self.current_phase = 0
+        
+    def on_epoch_begin(self, epoch, logs=None):
+        # Determine current phase
+        cumulative_epochs = 0
+        for i, phase in enumerate(self.phases):
+            cumulative_epochs += phase['epochs']
+            if epoch < cumulative_epochs:
+                if i != self.current_phase:
+                    self.current_phase = i
+                    self._apply_phase_settings(phase)
+                break
+    
+    def _apply_phase_settings(self, phase):
+        print(f"\n=== Entering Training Phase {self.current_phase + 1} ===")
+        
+        # Adjust layer freezing
+        total_layers = len(self.model.layers)
+        freeze_layers = phase['freeze_layers']
+        
+        for i, layer in enumerate(self.model.layers):
+            if i < freeze_layers:
+                layer.trainable = False
+            else:
+                layer.trainable = True
+        
+        # Adjust learning rate
+        current_lr = float(tf.keras.backend.get_value(self.model.optimizer.learning_rate))
+        new_lr = current_lr * phase['lr_multiplier']
+        tf.keras.backend.set_value(self.model.optimizer.learning_rate, new_lr)
+        
+        print(f"Frozen layers: {freeze_layers}/{total_layers}")
+        print(f"Learning rate: {new_lr}")
+        print(f"Augmentation probability: {phase['augmentation_prob']}")
+
+class MedicalMixup(Layer):
+    """
+    Mixup augmentation specifically designed for medical imaging
+    Mixes samples while preserving anatomical coherence
+    """
+    def __init__(self, alpha=0.2, **kwargs):
+        super().__init__(**kwargs)
+        self.alpha = alpha
+    
+    def call(self, inputs, training=None):
+        if not training:
+            return inputs
+            
+        x, y = inputs
+        batch_size = tf.shape(x)[0]
+        
+        # Sample lambda from Beta distribution
+        lambda_val = tf.random.uniform([], 0, self.alpha)
+        
+        # Create random permutation
+        indices = tf.random.shuffle(tf.range(batch_size))
+        
+        # Mix images and labels
+        mixed_x = lambda_val * x + (1 - lambda_val) * tf.gather(x, indices)
+        mixed_y = lambda_val * y + (1 - lambda_val) * tf.gather(y, indices)
+        
+        return mixed_x, mixed_y
+
+class MemoryCleanupCallback(tf.keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        gc.collect()
+        tf.keras.backend.clear_session()
+
+class EnsembleModel:
+    """
+    Ensemble of multiple models with knowledge distillation
+    """
+    def __init__(self, num_models=3):
+        self.num_models = num_models
+        self.models = []
+        self.teacher_model = None
+        
+    def create_diverse_models(self, base_model_fn):
+        """Create diverse models with different architectures"""
+        for i in range(self.num_models):
+            # Vary model parameters for diversity
+            model_params = {
+                'num_layers': [1, 2, 3][i % 3],
+                'num_heads': [2, 4, 2][i % 3],
+                'ff_dim': [96, 128, 160][i % 3],
+                'dropout': [0.1, 0.2, 0.3][i % 3]
+            }
+            model = base_model_fn(**model_params)
+            self.models.append(model)
+    
+    def train_ensemble(self, train_data, val_data, epochs=30):
+        """Train ensemble with progressive knowledge distillation"""
+        histories = []
+        
+        # Train individual models
+        for i, model in enumerate(self.models):
+            print(f"\nTraining model {i+1}/{self.num_models}")
+            history = model.fit(
+                train_data,
+                validation_data=val_data,
+                epochs=epochs,
+                verbose=1
+            )
+            histories.append(history)
+        
+        # Select best model as teacher
+        val_accs = [max(h.history['val_accuracy']) for h in histories]
+        best_idx = np.argmax(val_accs)
+        self.teacher_model = self.models[best_idx]
+        
+        return histories
+    
+    def predict_ensemble(self, X):
+        """Ensemble prediction with weighted voting"""
+        predictions = []
+        for model in self.models:
+            pred = model.predict(X)
+            predictions.append(pred)
+        
+        # Weighted average (give more weight to teacher)
+        weights = [0.4 if i == 0 else 0.3 for i in range(len(predictions))]
+        ensemble_pred = np.average(predictions, axis=0, weights=weights)
+        
+        return ensemble_pred
+
+class ModelOptimizer:
+    """
+    Optimize model for clinical deployment with compression techniques
+    """
+    def __init__(self, model):
+        self.original_model = model
+        self.optimized_models = {}
+    
+    def quantize_model(self):
+        """Apply post-training quantization for faster inference"""
+        print("Applying post-training quantization...")
+        
+        # Convert to TensorFlow Lite with quantization
+        converter = tf.lite.TFLiteConverter.from_keras_model(self.original_model)
+        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+        
+        # Use representative dataset for better quantization
+        def representative_data_gen():
+            for batch in val_dataset.take(10):  # Use 10 batches for calibration
+                # batch is ((mri_batch, pet_batch), labels)
+                mri_batch, pet_batch = batch[0]
+                yield [mri_batch.numpy().astype(np.float32), pet_batch.numpy().astype(np.float32)]
+        
+        converter.representative_dataset = representative_data_gen
+        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.inference_input_type = tf.int8
+        converter.inference_output_type = tf.int8
+        
+        quantized_model = converter.convert()
+        
+        # Save quantized model
+        with open('quantized_model.tflite', 'wb') as f:
+            f.write(quantized_model)
+        
+        return quantized_model
+    
+    def prune_model(self, target_sparsity=0.5):
+        """Apply magnitude-based pruning to reduce model size"""
+        print(f"Applying pruning with {target_sparsity} sparsity...")
+        
+        # Calculate number of batches BEFORE creating pruning_params
+        num_batches = tf.data.experimental.cardinality(train_dataset).numpy()
+        if num_batches == tf.data.experimental.UNKNOWN_CARDINALITY:
+            # Fallback: estimate based on dataset size and batch size
+            num_batches = len(train_df) // BATCH_SIZE
+        end_step = num_batches * 10  # Prune over 10 epochs
+        
+        # Define pruning schedule
+        pruning_params = {
+            'pruning_schedule': tfmot.sparsity.keras.PolynomialDecay(
+                initial_sparsity=0.0,
+                final_sparsity=target_sparsity,
+                begin_step=0,
+                end_step=end_step
+            )
+        }
+        
+        # Apply pruning to dense and conv layers
+        def apply_pruning_to_dense(layer):
+            if isinstance(layer, tf.keras.layers.Dense):
+                return tfmot.sparsity.keras.prune_low_magnitude(layer, **pruning_params)
+            return layer
+        
+        pruned_model = tf.keras.models.clone_model(
+            self.original_model,
+            clone_function=apply_pruning_to_dense,
+        )
+        
+        return pruned_model
+
+    
+    def create_ensemble_tflite(self, models):
+        """Create ensemble of TensorFlow Lite models for deployment"""
+        lite_models = []
+        
+        for i, model in enumerate(models):
+            converter = tf.lite.TFLiteConverter.from_keras_model(model)
+            converter.optimizations = [tf.lite.Optimize.DEFAULT]
+            lite_model = converter.convert()
+            
+            filename = f'ensemble_model_{i}.tflite'
+            with open(filename, 'wb') as f:
+                f.write(lite_model)
+            lite_models.append(filename)
+        
+        return lite_models
+    
+class MedicalExplainer:
+    """
+    Generate explanations for medical imaging predictions
+    Critical for clinical acceptance and trust
+    """
+    def __init__(self, model):
+        self.model = model
+        self.grad_model = self._build_grad_model()
+    
+    def _build_grad_model(self):
+        """Build gradient model for Grad-CAM"""
+        # Get the last convolutional layer from each CNN branch
+        mri_conv_layer = None
+        pet_conv_layer = None
+        
+        for layer in self.model.layers:
+            if isinstance(layer, tf.keras.layers.Conv3D):
+                if 'mri' in layer.name.lower():
+                    mri_conv_layer = layer
+                elif 'pet' in layer.name.lower():
+                    pet_conv_layer = layer
+        
+        # Create gradient model
+        grad_model = tf.keras.models.Model(
+            inputs=self.model.inputs,
+            outputs=[mri_conv_layer.output, pet_conv_layer.output, self.model.output]
+        )
+        
+        return grad_model
+    
+    def generate_gradcam(self, mri_data, pet_data, class_idx=None):
+        """
+        Generate Grad-CAM heatmaps for MRI and PET modalities
+        """
+        with tf.GradientTape() as tape:
+            mri_conv_output, pet_conv_output, predictions = self.grad_model([mri_data, pet_data])
+            
+            if class_idx is None:
+                class_idx = tf.argmax(predictions[0])
+            
+            class_output = predictions[:, class_idx]
+        
+        # Compute gradients
+        mri_grads = tape.gradient(class_output, mri_conv_output)
+        pet_grads = tape.gradient(class_output, pet_conv_output)
+        
+        # Global average pooling of gradients
+        mri_pooled_grads = tf.reduce_mean(mri_grads, axis=(1, 2, 3, 4))
+        pet_pooled_grads = tf.reduce_mean(pet_grads, axis=(1, 2, 3, 4))
+        
+        # Multiply feature maps by gradients
+        mri_conv_output = mri_conv_output[0]
+        pet_conv_output = pet_conv_output[0]
+        
+        for i in range(mri_pooled_grads.shape[-1]):
+            mri_conv_output = mri_conv_output[:, :, :, :, i] * mri_pooled_grads[i]
+            pet_conv_output = pet_conv_output[:, :, :, :, i] * pet_pooled_grads[i]
+        
+        # Create heatmaps
+        mri_heatmap = tf.reduce_mean(mri_conv_output, axis=-1)
+        pet_heatmap = tf.reduce_mean(pet_conv_output, axis=-1)
+        
+        # Normalize heatmaps
+        mri_heatmap = tf.maximum(mri_heatmap, 0) / tf.reduce_max(mri_heatmap)
+        pet_heatmap = tf.maximum(pet_heatmap, 0) / tf.reduce_max(pet_heatmap)
+        
+        return mri_heatmap.numpy(), pet_heatmap.numpy(), predictions.numpy()
+    
+    def visualize_attention(self, mri_data, pet_data):
+        """
+        Extract and visualize cross-modal attention weights
+        """
+        # Get attention layer from the model
+        attention_layer = None
+        for layer in self.model.layers:
+            if isinstance(layer, CrossModalAttentionFusion):
+                attention_layer = layer
+                break
+        
+        if attention_layer is None:
+            print("No CrossModalAttentionFusion layer found")
+            return None
+        
+        # Create intermediate model to get attention weights
+        attention_model = tf.keras.models.Model(
+            inputs=self.model.inputs,
+            outputs=attention_layer.output
+        )
+        
+        # Get attention outputs
+        attention_output = attention_model([mri_data, pet_data])
+        
+        return attention_output.numpy()
+    
+    def _preprocess_image(self, path):
+        """Load preprocessed .npy file directly"""
+        # CHANGE FROM loading NIfTI to loading .npy
+        data = np.load(path)  # Load the preprocessed .npy file directly
+        
+        # The data should already be in the target shape (64, 128, 128, 1) and normalized
+        # Ensure it has 4 dimensions (D, H, W, C) for TensorFlow
+        if data.ndim == 3:
+            data = np.expand_dims(data, axis=-1)
+        
+        return np.expand_dims(data, axis=0)  # Add batch dimension
+
+
+    def generate_clinical_report(self, mri_path, pet_path, save_path):
+        """
+        Generate comprehensive clinical explanation report
+        """
+        # Load and preprocess images
+        mri_data = self._preprocess_image(mri_path)
+        pet_data = self._preprocess_image(pet_path)
+        
+        # Get predictions
+        prediction = self.model.predict([mri_data, pet_data])
+        predicted_class = np.argmax(prediction[0])
+        confidence = prediction[0][predicted_class]
+        
+        # Generate explanations
+        mri_heatmap, pet_heatmap, _ = self.generate_gradcam(mri_data, pet_data)
+        attention_weights = self.visualize_attention(mri_data, pet_data)
+        
+        # Create visualization
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Original images (middle slice)
+        mri_slice = mri_data[0, mri_data.shape[1]//2, :, :, 0]
+        pet_slice = pet_data[0, pet_data.shape[1]//2, :, :, 0]
+        
+        axes[0, 0].imshow(mri_slice, cmap='gray')
+        axes[0, 0].set_title('MRI (Axial)')
+        axes[0, 0].axis('off')
+        
+        axes[0, 1].imshow(pet_slice, cmap='hot')
+        axes[0, 1].set_title('PET (Axial)')
+        axes[0, 1].axis('off')
+        
+        # Grad-CAM overlays
+        axes[1, 0].imshow(mri_slice, cmap='gray', alpha=0.7)
+        axes[1, 0].imshow(mri_heatmap[mri_heatmap.shape[0]//2], cmap='jet', alpha=0.3)
+        axes[1, 0].set_title('MRI + Grad-CAM')
+        axes[1, 0].axis('off')
+        
+        axes[1, 1].imshow(pet_slice, cmap='hot', alpha=0.7)
+        axes[1, 1].imshow(pet_heatmap[pet_heatmap.shape[0]//2], cmap='jet', alpha=0.3)
+        axes[1, 1].set_title('PET + Grad-CAM')
+        axes[1, 1].axis('off')
+        
+        # Prediction summary
+        class_names = ['CN', 'MCI', 'AD']  # Adjust based on your classes
+        axes[0, 2].bar(class_names, prediction[0])
+        axes[0, 2].set_title(f'Prediction: {class_names[predicted_class]} ({confidence:.2f})')
+        axes[0, 2].set_ylabel('Confidence')
+        
+        # Attention visualization
+        if attention_weights is not None:
+            axes[1, 2].imshow(attention_weights[0].mean(axis=0), cmap='viridis')
+            axes[1, 2].set_title('Cross-Modal Attention')
+            axes[1, 2].axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Generate text report
+        report = f"""
+        MEDICAL AI ANALYSIS REPORT
+        ==========================
+        
+        Patient ID: {os.path.basename(mri_path).split('.')[0]}
+        Analysis Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        
+        PREDICTION RESULTS:
+        - Primary Diagnosis: {class_names[predicted_class]}
+        - Confidence Score: {confidence:.3f}
+        - Alternative Diagnoses:
+        """
+        
+        for i, (class_name, prob) in enumerate(zip(class_names, prediction[0])):
+            if i != predicted_class:
+                report += f"  â€¢ {class_name}: {prob:.3f}\n"
+        
+        report += f"""
+        
+        EXPLANATION:
+        - The model focused on regions highlighted in the Grad-CAM visualization
+        - Cross-modal attention shows how MRI and PET information was integrated
+        - High attention areas indicate regions most relevant for the diagnosis
+        
+        CLINICAL NOTES:
+        - This analysis is for research purposes ONLY
+        - Clinical correlation is required for diagnostic decisions
+        - Model trained on ADNI dataset with {len(train_df)} training samples
+        """
+        
+        # Save report
+        with open(save_path.replace('.png', '_report.txt'), 'w') as f:
+            f.write(report)
+        
+        return report
+    
+
+
+class ClinicalInferenceSystem:
+    """
+    Production-ready inference system for clinical deployment
+    """
+    def __init__(self, model_path, config_path=None):
+        self.model = tf.keras.models.load_model(model_path)
+        self.config = self._load_config(config_path)
+        self.explainer = MedicalExplainer(self.model)
+        
+    def _load_config(self, config_path):
+        """Load deployment configuration"""
+        default_config = {
+            'input_shape': (64, 128, 128, 1),
+            'batch_size': 1,
+            'confidence_threshold': 0.7,
+            'class_names': ['CN', 'MCI', 'AD'],
+            'preprocessing': {
+                'normalize': True,
+                'target_shape': (64, 128, 128),
+                'interpolation_order': 3
+            }
+        }
+        
+        if config_path and os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                user_config = json.load(f)
+            default_config.update(user_config)
+        
+        return default_config
+    
+    def preprocess_scan(self, mri_path, pet_path):
+        """
+        Preprocess medical scans for inference
+        Includes quality checks and standardization
+        """
+        def load_and_validate(path, modality):
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"{modality} file not found: {path}")
+            
+            try:
+                nii = nib.load(path)
+                data = nii.get_fdata()
+                
+                # Basic quality checks
+                if data.ndim not in [3, 4]:
+                    raise ValueError(f"Invalid {modality} dimensions: {data.shape}")
+                
+                if data.ndim == 4:
+                    data = data[..., 0]
+                
+                # Check for reasonable intensity ranges
+                if modality == 'MRI':
+                    if data.max() < 10:  # Suspiciously low for MRI
+                        print(f"Warning: Low intensity range in MRI: {data.min()}-{data.max()}")
+                elif modality == 'PET':
+                    if data.max() > 10000:  # Suspiciously high for PET
+                        print(f"Warning: High intensity range in PET: {data.min()}-{data.max()}")
+                
+                return data
+                
+            except Exception as e:
+                raise RuntimeError(f"Error loading {modality}: {str(e)}")
+                def preprocess_volume(data, modality):
+                    # Reasoning: This logic MUST be identical to your offline script
+                    # to prevent train-test skew. Using order=1 here is crucial if you used it there.
+                    target_shape = self.config['preprocessing']['target_shape']
+                    zoom_factors = [target_shape[i]/data.shape[i] for i in range(3)]
+                    data_resized = zoom(data, zoom_factors, order=3)
+                    # ... rest of the normalization logic ...
+                    return np.expand_dims(data_norm, axis=(0, -1))
+        
+        # Load images
+        mri_data = load_and_validate(mri_path, 'MRI')
+        pet_data = load_and_validate(pet_path, 'PET')
+        
+        # Preprocess each modality
+        def preprocess_volume(data):
+            # Resize to target shape
+            target_shape = self.config['preprocessing']['target_shape']
+            zoom_factors = [target_shape[i]/data.shape[i] for i in range(3)]
+            data_resized = zoom(data, zoom_factors, 
+                              order=self.config['preprocessing']['interpolation_order'])
+            
+            # Handle NaN/Inf
+            data_resized = np.nan_to_num(data_resized, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Normalization
+            if self.config['preprocessing']['normalize']:
+                mean = np.mean(data_resized)
+                std = np.std(data_resized)
+                
+                if std < 1e-6 or np.isclose(std, 0):
+                    data_norm = np.zeros_like(data_resized)
+                else:
+                    data_norm = (data_resized - mean) / (std + 1e-9)
+            else:
+                data_norm = data_resized
+            
+            # Final cleanup
+            data_norm = np.nan_to_num(data_norm, nan=0.0)
+            
+            return np.expand_dims(data_norm, axis=(0, -1))  # Add batch and channel dims
+        
+        mri_processed = preprocess_volume(mri_data)
+        pet_processed = preprocess_volume(pet_data)
+        
+        return mri_processed, pet_processed
+    
+    def predict_with_confidence(self, mri_path, pet_path, generate_explanation=True):
+        """
+        Perform prediction with confidence assessment and explanation
+        """
+        start_time = time.time()
+        
+        # Preprocess
+        mri_data, pet_data = self.preprocess_scan(mri_path, pet_path)
+        preprocessing_time = time.time() - start_time
+        
+        # Inference
+        inference_start = time.time()
+        prediction = self.model.predict([mri_data, pet_data], verbose=0)
+        inference_time = time.time() - inference_start
+        
+        # Post-process results
+        predicted_class = np.argmax(prediction[0])
+        confidence = prediction[0][predicted_class]
+        class_name = self.config['class_names'][predicted_class]
+        
+        # Determine reliability
+        reliability = 'High' if confidence > self.config['confidence_threshold'] else 'Low'
+        
+        # Generate explanation if requested
+        explanation = None
+        if generate_explanation:
+            explanation_start = time.time()
+            mri_heatmap, pet_heatmap, _ = self.explainer.generate_gradcam(mri_data, pet_data)
+            explanation_time = time.time() - explanation_start
+            
+            explanation = {
+                'mri_heatmap': mri_heatmap,
+                'pet_heatmap': pet_heatmap,
+                'generation_time': explanation_time
+            }
+        
+        # Compile results
+        results = {
+            'prediction': {
+                'class': class_name,
+                'class_index': int(predicted_class),
+                'confidence': float(confidence),
+                'all_probabilities': prediction[0].tolist(),
+                'reliability': reliability
+            },
+            'timing': {
+                'preprocessing': preprocessing_time,
+                'inference': inference_time,
+                'total': time.time() - start_time
+            },
+            'explanation': explanation,
+            'metadata': {
+                'model_config': self.config,
+                'timestamp': datetime.now().isoformat(),
+                'input_files': {'mri': mri_path, 'pet': pet_path}
+            }
+        }
+        
+        return results
+    
+    def batch_inference(self, patient_list, output_dir):
+        """
+        Process multiple patients for batch analysis
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        results = []
+        
+        for i, (patient_id, mri_path, pet_path) in enumerate(patient_list):
+            print(f"Processing patient {i+1}/{len(patient_list)}: {patient_id}")
+            
+            try:
+                result = self.predict_with_confidence(mri_path, pet_path)
+                result['patient_id'] = patient_id
+                results.append(result)
+                
+                # Save individual result
+                output_file = os.path.join(output_dir, f"{patient_id}_analysis.json")
+                with open(output_file, 'w') as f:
+                    json.dump(result, f, indent=2)
+                
+                # Generate explanation report
+                if result['explanation']:
+                    report_path = os.path.join(output_dir, f"{patient_id}_explanation.png")
+                    self.explainer.generate_clinical_report(mri_path, pet_path, report_path)
+                
+            except Exception as e:
+                print(f"Error processing {patient_id}: {str(e)}")
+                results.append({
+                    'patient_id': patient_id,
+                    'error': str(e),
+                    'timestamp': datetime.now().isoformat()
+                })
+        
+        # Save batch summary
+        summary_file = os.path.join(output_dir, "batch_summary.json")
+        with open(summary_file, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        return results
+
+class ModelValidator:
+    """
+    Comprehensive validation framework for medical imaging models
+    """
+    def __init__(self, model, test_dataset):
+        self.model = model
+        self.test_dataset = test_dataset
+        
+    def comprehensive_evaluation(self):
+        """
+        Perform comprehensive model evaluation
+        """
+        print("Performing comprehensive model evaluation...")
+        
+        # Collect all predictions and ground truth
+        y_true, y_pred, y_prob = [], [], []
+        inference_times = []
+        
+        # Iterate through the dataset
+        for (X_mri, X_pet), y in self.test_dataset:
+            start_time = time.time()
+            # The model expects a list or tuple of inputs
+            predictions = self.model.predict([X_mri, X_pet], verbose=0) 
+            inference_time = time.time() - start_time
+            inference_times.append(inference_time / len(X_mri))  # Per sample
+            
+            y_true.extend(np.argmax(y, axis=1))
+            y_pred.extend(np.argmax(predictions, axis=1))
+            y_prob.extend(predictions)
+        
+        y_true = np.array(y_true)
+        y_pred = np.array(y_pred)
+        y_prob = np.array(y_prob)
+        
+        # Calculate comprehensive metrics
+        results = {
+            'overall_accuracy': accuracy_score(y_true, y_pred),
+            'balanced_accuracy': balanced_accuracy_score(y_true, y_pred),
+            'matthews_corrcoef': matthews_corrcoef(y_true, y_pred),
+            'cohen_kappa': cohen_kappa_score(y_true, y_pred),
+            'macro_f1': f1_score(y_true, y_pred, average='macro'),
+            'weighted_f1': f1_score(y_true, y_pred, average='weighted'),
+            'inference_time': {
+                'mean': np.mean(inference_times),
+                'std': np.std(inference_times),
+                'min': np.min(inference_times),
+                'max': np.max(inference_times)
+            }
+        }
+        
+        # Per-class metrics
+        class_names = ['CN', 'MCI', 'AD']  # Adjust based on your classes
+        class_report = classification_report(y_true, y_pred, target_names=class_names, output_dict=True)
+        results['per_class_metrics'] = class_report
+        
+        # ROC-AUC for each class (one-vs-rest)
+        results['roc_auc'] = {}
+        for i, class_name in enumerate(class_names):
+            y_true_binary = (y_true == i).astype(int)
+            y_prob_class = y_prob[:, i]
+            results['roc_auc'][class_name] = roc_auc_score(y_true_binary, y_prob_class)
+        
+        # Confusion matrix
+        results['confusion_matrix'] = confusion_matrix(y_true, y_pred).tolist()
+        
+        # Statistical significance tests
+        results['statistical_tests'] = self._perform_statistical_tests(y_true, y_pred, y_prob)
+        
+        return results
+    
+    def _perform_statistical_tests(self, y_true, y_pred, y_prob):
+        """
+        Perform statistical significance tests
+        """
+        # McNemar's test for comparing with baseline
+        # (This would require baseline predictions for comparison)
+        
+        # Confidence intervals for metrics
+        n = len(y_true)
+        accuracy = accuracy_score(y_true, y_pred)
+        
+        # Wilson score interval for accuracy
+        z = 1.96  # 95% confidence
+        accuracy_ci_lower = (accuracy + z**2/(2*n) - z*np.sqrt((accuracy*(1-accuracy) + z**2/(4*n))/n)) / (1 + z**2/n)
+        accuracy_ci_upper = (accuracy + z**2/(2*n) + z*np.sqrt((accuracy*(1-accuracy) + z**2/(4*n))/n)) / (1 + z**2/n)
+        
+        return {
+            'sample_size': n,
+            'accuracy_ci_95': [accuracy_ci_lower, accuracy_ci_upper],
+            'confidence_level': 0.95
+        }
+    
+    def generate_performance_report(self, results, save_path):
+        """
+        Generate comprehensive performance report
+        """
+        # Create visualizations
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # Confusion Matrix
+        cm = np.array(results['confusion_matrix'])
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                   xticklabels=['CN', 'MCI', 'AD'], 
+                   yticklabels=['CN', 'MCI', 'AD'], ax=axes[0,0])
+        axes[0,0].set_title('Confusion Matrix')
+        axes[0,0].set_ylabel('True Label')
+        axes[0,0].set_xlabel('Predicted Label')
+        
+        # Per-class F1 scores
+        class_names = list(results['per_class_metrics'].keys())[:-3]  # Exclude avg metrics
+        f1_scores = [results['per_class_metrics'][cls]['f1-score'] for cls in class_names]
+        axes[0,1].bar(class_names, f1_scores)
+        axes[0,1].set_title('Per-Class F1 Scores')
+        axes[0,1].set_ylabel('F1 Score')
+        axes[0,1].set_ylim(0, 1)
+        
+        # ROC AUC scores
+        roc_scores = list(results['roc_auc'].values())
+        axes[0,2].bar(class_names, roc_scores)
+        axes[0,2].set_title('Per-Class ROC AUC')
+        axes[0,2].set_ylabel('AUC')
+        axes[0,2].set_ylim(0, 1)
+        
+        # Inference time distribution
+        times = [results['inference_time']['mean']]
+        errors = [results['inference_time']['std']]
+        axes[1,0].bar(['Inference Time'], times, yerr=errors, capsize=5)
+        axes[1,0].set_title('Inference Time (seconds)')
+        axes[1,0].set_ylabel('Time (s)')
+        
+        # Overall metrics comparison
+        metrics = ['Overall Accuracy', 'Balanced Accuracy', 'Macro F1', 'Matthews CC']
+        values = [
+            results['overall_accuracy'],
+            results['balanced_accuracy'], 
+            results['macro_f1'],
+            results['matthews_corrcoef']
+        ]
+        axes[1,1].bar(metrics, values)
+        axes[1,1].set_title('Overall Performance Metrics')
+        axes[1,1].set_ylabel('Score')
+        axes[1,1].set_ylim(0, 1)
+        axes[1,1].tick_params(axis='x', rotation=45)
+        
+        # Precision-Recall per class
+        precisions = [results['per_class_metrics'][cls]['precision'] for cls in class_names]
+        recalls = [results['per_class_metrics'][cls]['recall'] for cls in class_names]
+        
+        x = np.arange(len(class_names))
+        width = 0.35
+        axes[1,2].bar(x - width/2, precisions, width, label='Precision')
+        axes[1,2].bar(x + width/2, recalls, width, label='Recall')
+        axes[1,2].set_xlabel('Class')
+        axes[1,2].set_ylabel('Score')
+        axes[1,2].set_title('Precision vs Recall')
+        axes[1,2].set_xticks(x)
+        axes[1,2].set_xticklabels(class_names)
+        axes[1,2].legend()
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # Generate text report
+        report = f"""
+        COMPREHENSIVE MODEL EVALUATION REPORT
+        =====================================
+        
+        Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        Test Samples: {results['statistical_tests']['sample_size']}
+        
+        OVERALL PERFORMANCE:
+        â€¢ Overall Accuracy: {results['overall_accuracy']:.4f}
+        â€¢ Balanced Accuracy: {results['balanced_accuracy']:.4f}
+        â€¢ Matthews Correlation Coefficient: {results['matthews_corrcoef']:.4f}
+        â€¢ Cohen's Kappa: {results['cohen_kappa']:.4f}
+        â€¢ Macro F1-Score: {results['macro_f1']:.4f}
+        â€¢ Weighted F1-Score: {results['weighted_f1']:.4f}
+        
+        CONFIDENCE INTERVALS (95%):
+        â€¢ Accuracy: [{results['statistical_tests']['accuracy_ci_95'][0]:.4f}, {results['statistical_tests']['accuracy_ci_95'][1]:.4f}]
+        
+        PER-CLASS PERFORMANCE:
+        """
+        
+        for class_name in class_names:
+            metrics = results['per_class_metrics'][class_name]
+            report += f"""
+        {class_name}:
+        â€¢ Precision: {metrics['precision']:.4f}
+        â€¢ Recall: {metrics['recall']:.4f}
+        â€¢ F1-Score: {metrics['f1-score']:.4f}
+        â€¢ Support: {metrics['support']}
+        â€¢ ROC AUC: {results['roc_auc'][class_name]:.4f}
+        """
+        
+        report += f"""
+        
+        INFERENCE PERFORMANCE:
+        â€¢ Mean Inference Time: {results['inference_time']['mean']:.4f} seconds
+        â€¢ Std Inference Time: {results['inference_time']['std']:.4f} seconds
+        â€¢ Min Inference Time: {results['inference_time']['min']:.4f} seconds
+        â€¢ Max Inference Time: {results['inference_time']['max']:.4f} seconds
+        
+        CLINICAL CONSIDERATIONS:
+        â€¢ The model shows {'high' if results['balanced_accuracy'] > 0.8 else 'moderate' if results['balanced_accuracy'] > 0.7 else 'low'} performance for clinical deployment
+        â€¢ Inference time is {'acceptable' if results['inference_time']['mean'] < 5.0 else 'potentially slow'} for clinical workflows
+        â€¢ Statistical significance confirmed with 95% confidence intervals
+        
+        RECOMMENDATIONS:
+        â€¢ {'Deploy with clinical validation' if results['balanced_accuracy'] > 0.8 else 'Additional training recommended'}
+        â€¢ {'Suitable for real-time analysis' if results['inference_time']['mean'] < 2.0 else 'Consider optimization for real-time use'}
+        â€¢ {'High reliability across all classes' if min([results['per_class_metrics'][cls]['f1-score'] for cls in class_names]) > 0.7 else 'Monitor performance on minority classes'}
+        """
+        
+        # Save report
+        with open(save_path.replace('.png', '_report.txt'), 'w') as f:
+            f.write(report)
+        
+        return report
+
+# Phase 5 Integration Example
+def deploy_phase5_system():
+    print("=== Phase 5: Deployment and Production Optimization ===")
+    
+    # 1. Model Optimization - SKIP TFLite conversion
+    optimizer = ModelOptimizer(model)
+    
+    print("1. Skipping TensorFlow Lite conversion (model too complex)")
+    # quantized_model = optimizer.quantize_model()  # Comment out
+    # pruned_model = optimizer.prune_model(target_sparsity=0.3)  # Comment out
+    
+    # 2. Comprehensive Evaluation - Keep this
+    print("2. Performing comprehensive evaluation...")
+    validator = ModelValidator(model, test_dataset)
+    evaluation_results = validator.comprehensive_evaluation()
+    
+    # Generate performance report
+    validator.generate_performance_report(
+        evaluation_results, 
+        'phase5_performance_report.png'
+    )
+    
+    # 3. Setup Clinical Inference System
+    print("3. Setting up clinical inference system...")
+    
+    # Save optimized model
+    model.save('clinical_model.h5')
+    
+    # Create clinical system
+    clinical_system = ClinicalInferenceSystem('clinical_model.h5')
+    
+    # 4. Demonstration
+    print("4. Running clinical demonstration...")
+    
+    # Example patient analysis
+    sample_patient = test_df.iloc[0]
+    results = clinical_system.predict_with_confidence(
+        sample_patient['Image_Path_MRI'],
+        sample_patient['Image_Path_PET'],
+        generate_explanation=True
+    )
+    
+    print(f"Sample prediction: {results['prediction']['class']} "
+          f"(confidence: {results['prediction']['confidence']:.3f})")
+    
+    # 5. Documentation
+    print("5. Generating deployment documentation...")
+    
+    deployment_config = {
+        'model_version': '1.0.0',
+        'deployment_date': datetime.now().isoformat(),
+        'performance_metrics': evaluation_results,
+        'hardware_requirements': {
+            'gpu_memory': '8GB+',
+            'ram': '16GB+',
+            'inference_time': f"{evaluation_results['inference_time']['mean']:.2f}s per case"
+        },
+        'software_requirements': {
+            'tensorflow': tf.__version__,
+            'python': '3.8+',
+            'dependencies': ['nibabel', 'scikit-learn', 'numpy', 'matplotlib']
+        }
+    }
+    
+    with open('deployment_config.json', 'w') as f:
+        json.dump(deployment_config, f, indent=2)
+    
+    print("Phase 5 deployment pipeline completed successfully!")
+    return clinical_system
+
+# ADD the new dataset creation calls
+# Load the dataframe with paths to the pre-processed .npy files
+
+BATCH_SIZE = 8 
+
+# TRansformer-CNN hybrid model
+def create_cnn_branch(input_layer):
+    """Improved CNN branch with proper normalization and regularization"""
+    
+    x = Conv3D(32, (3,3,3), padding='same')(input_layer)
+    x = BatchNormalization()(x)  # Better for CNN layers
+    x = tf.keras.layers.Activation('relu')(x)
+    x = MaxPooling3D((2,2,2))(x)
+    x = Dropout(0.2)(x)  # Add early dropout
+
+    x = Conv3D(64, (3,3,3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = tf.keras.layers.Activation('relu')(x)
+    x = MaxPooling3D((2,2,2))(x)
+    x = Dropout(0.3)(x)
+
+    x = Conv3D(128, (3,3,3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = tf.keras.layers.Activation('relu')(x)
+    x = MaxPooling3D((2,2,2))(x)
+    x = Dropout(0.4)(x)  # Progressive dropout increase
+
+    x = Conv3D(256, (3,3,3), padding='same')(x)
+    x = BatchNormalization()(x)
+    x = tf.keras.layers.Activation('relu')(x)
+    x = MaxPooling3D((2,2,2))(x)
+    x = Dropout(0.5)(x)  # Higher dropout in deeper layers
+
+    # Get final conv layer shape
+    conv_shape = tuple(x.shape)[1:]
+    print(f"Final CNN features: {conv_shape}")
+
+    # Calculate dimensions
+    spatial_dims = conv_shape[:-1]
+    channels = conv_shape[-1]
+    patch_dims = np.prod(spatial_dims)
+
+    # Reshape with validation
+    x = Reshape((patch_dims, channels))(x)
+
+    return x
+
+
+def transformer_encoder(inputs, num_layers=1, head_size=64, num_heads=4, ff_dim=128, dropout=0.2):
+    x = inputs
+    
+    attention = MultiHeadAttention(num_heads=num_heads, key_dim=head_size, dropout=dropout)(x, x)
+    attention = Dropout(dropout)(attention)
+    attention = Add()([attention, x])
+    attention = LayerNormalization(epsilon=1e-6)(attention)
+
+    ffn = Dense(ff_dim, activation="gelu")(attention)
+    ffn = Dropout(dropout)(ffn)
+    ffn = Dense(inputs.shape[-1])(ffn)
+    ffn = Add()([ffn, attention])
+    x = LayerNormalization(epsilon=1e-6)(ffn)
+    
+    return x
+
+
+def focal_loss(alpha=0.25, gamma=2.0):
+    def focal_loss_fixed(y_true, y_pred):
+        epsilon = 1e-7  # Increased epsilon for stability
+        y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+        
+        # More stable focal loss computation
+        cross_entropy = -tf.reduce_sum(y_true * tf.math.log(y_pred + epsilon), axis=1)
+        
+        # Get prediction probability for true class
+        p_t = tf.reduce_sum(y_true * y_pred, axis=1)
+        p_t = tf.clip_by_value(p_t, epsilon, 1.0 - epsilon)  # Clip p_t as well
+        
+        # More stable focal weight calculation
+        focal_weight = tf.pow(1.0 - p_t, gamma)
+        
+        # Apply focal loss
+        focal_loss_value = alpha * focal_weight * cross_entropy
+        
+        return tf.reduce_mean(focal_loss_value)
+    return focal_loss_fixed
+
+# Create optimized dataset with proper threading
+def create_optimized_dataset(generator, batch_size=16):
+    dataset = tf.data.Dataset.from_generator(
+        lambda: generator,
+        output_signature=generator.output_signature
+    )
+    
+    # Critical optimizations for medical imaging
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)  # Overlap data prep with training
+    dataset = dataset.batch(batch_size)
+    dataset = dataset.prefetch(tf.data.AUTOTUNE)  # Double prefetch for stability
+    
+    return dataset
+
+train_dataset = create_dataset(train_df, BATCH_SIZE, encoder, shuffle=True)
+val_dataset = create_dataset(val_df, BATCH_SIZE, encoder, shuffle=False)
+test_dataset = create_dataset(test_df, BATCH_SIZE, encoder, shuffle=False)
+
+with strategy.scope():
+    # Inputs
+    mri_input = Input(shape=(64, 128, 128, 1), name="mri_input")
+    pet_input = Input(shape=(64, 128, 128, 1), name="pet_input")
+
+    # Enhanced CNN branches (keep your existing create_cnn_branch)
+    mri_features = create_cnn_branch(mri_input)
+    pet_features = create_cnn_branch(pet_input)
+
+    # ENHANCED: Advanced cross-modal fusion
+    fusion_layer = CrossModalAttentionFusion(d_model=128, num_heads=4)
+    fused_features = fusion_layer([mri_features, pet_features])
+    
+    # Add dropout after fusion
+    fused_features = Dropout(0.4)(fused_features)
+
+    # Enhanced transformer with residual connections
+    x = transformer_encoder(fused_features, num_layers=1, head_size=32, num_heads=2, ff_dim=64, dropout=0.2)
+    
+    # Multi-scale feature aggregation
+    global_features = GlobalAveragePooling1D()(x)
+    max_features = tf.keras.layers.GlobalMaxPooling1D()(x) # Switched pooling method to Tensorflow Function
+    combined_features = Concatenate()([global_features, max_features])
+    
+    # Enhanced classification head
+    image_features = Dense(256, activation='relu')(combined_features)
+    image_features = Dropout(0.6)(image_features)
+    image_features = Dense(128, activation='relu')(image_features)
+    image_features = Dropout(0.5)(image_features)
+
+    # Output with label smoothing support
+    num_classes = len(encoder.categories_[0])
+    x = Dense(
+        num_classes,
+        kernel_initializer=tf.keras.initializers.VarianceScaling(
+            scale=0.05,
+            mode='fan_in',
+            distribution='truncated_normal'
+        )
+    )(image_features)
+
+    output = tf.keras.layers.Activation('softmax', dtype='float32')(x)
+
+    model = Model(inputs=[mri_input, pet_input], outputs=output)
+    
+    base_optimizer = tf.keras.optimizers.AdamW(
+        learning_rate=1e-5,
+        weight_decay=1e-5,
+        beta_1=0.9,
+        beta_2=0.999,
+        clipnorm=1.0
+    )
+
+    
+    # Conditional mixed precision wrapping (safer approach)
+    if mixed_precision.global_policy().name == 'mixed_float16':
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_optimizer)
+    else:
+        optimizer = base_optimizer
+    
+    model.compile(
+        optimizer=tf.keras.optimizers.AdamW(learning_rate=1e-5, clipnorm=1.0),
+        loss='categorical_crossentropy',  # Standard loss
+        metrics=['accuracy', 'auc', 'precision', 'recall'],
+        jit_compile=False
+    )
+
+print("\n=== GPU Utilization Check ===")
+print("Physical GPUs:", tf.config.list_physical_devices('GPU'))
+print("Visible GPU:", tf.test.gpu_device_name())
+
+print(" ")
+print("\n=== GPU Verification ===")
+print("Physical GPUs:", tf.config.list_physical_devices('GPU'))
+print("Logical GPUs:", tf.config.list_logical_devices('GPU'))
+print(" ")
+
+def check_data_quality(df_sample):
+    for idx, row in df_sample.head(5).iterrows():
+        mri_data = np.load(row['Preprocessed_Path_MRI'])
+        pet_data = np.load(row['Preprocessed_Path_PET'])
+        
+        print(f"Sample {idx}:")
+        print(f"  MRI - Shape: {mri_data.shape}, Range: [{mri_data.min():.3f}, {mri_data.max():.3f}]")
+        print(f"  MRI - NaN count: {np.isnan(mri_data).sum()}, Inf count: {np.isinf(mri_data).sum()}")
+        print(f"  PET - Shape: {pet_data.shape}, Range: [{pet_data.min():.3f}, {pet_data.max():.3f}]")
+        print(f"  PET - NaN count: {np.isnan(pet_data).sum()}, Inf count: {np.isinf(pet_data).sum()}")
+        print()
+
+check_data_quality(train_df)
+
+print("Unique groups in preprocessed data:", df_preprocessed['Group'].unique())
+print("Group counts:", df_preprocessed['Group'].value_counts())
+
+# Only fit encoder if you have multiple classes
+if len(df_preprocessed['Group'].unique()) > 1:
+    encoder.fit(df_preprocessed["Group"].values.reshape(-1, 1))
+else:
+    print("ERROR: Only one class found in data!")
+    exit(1)
+
+from datetime import datetime
+log_dir = "logs/fit/" + datetime.now().strftime("%Y%m%d-%H%M%S")
+
+# TensorBoard callback with critical medical imaging-specific profiling
+tensorboard = tf.keras.callbacks.TensorBoard(
+    log_dir=log_dir,
+    histogram_freq=1,          # Log weight histograms every epoch
+    write_graph=True,          # Visualize model architecture
+    write_images=False,        # Don't log model weights as images
+    update_freq='epoch',       # Reduce I/O overhead
+    profile_batch=0,     # Profile batches 10-20 once per epoch
+    embeddings_freq=0          # Disable embeddings (not needed for 3D)
+)
+
+def hybrid_learning_schedule(epoch, lr):
+    """Curriculum learning followed by cosine annealing"""
+    if epoch < 5:
+        return 1e-3  # Curriculum: Higher LR for initial easy learning
+    elif epoch < 15:
+        return 5e-4  # Curriculum: Standard LR
+    else:
+        # Switch to cosine annealing after epoch 15
+        restart_period = 15
+        current_cycle = (epoch - 15) % restart_period
+        min_lr = 1e-6
+        max_lr = 1e-4
+        lr_range = max_lr - min_lr
+        cosine_factor = 0.5 * (1 + np.cos(np.pi * current_cycle / restart_period))
+        return min_lr + lr_range * cosine_factor
+
+# Minimal callbacks for speed testing:
+fast_callbacks = [
+    EarlyStopping(
+        monitor='val_auc',
+        patience=8,
+        restore_best_weights=True,
+        mode='max'
+    ),
+    tf.keras.callbacks.ModelCheckpoint(
+        filepath='best_model.keras',
+        monitor='val_auc',
+        save_best_only=True,
+        mode='max'
+    ),
+    MemoryCleanupCallback()  # Add this
+]
+
+
+print("Classes seen by encoder:", encoder.categories_)
+print("Label distribution in training set:")
+print(train_df["Group"].value_counts())
+
+model.summary()
+#test_sample = next(iter(train_generator))
+#model.predict(test_sample[0])
+
+print("\n=== Data Validation ===")
+sample_path = df_combined["Image_Path_MRI"].iloc[0]
+sample_nii = nib.load(sample_path)
+print(f"Sample MRI header: {sample_nii.header}")
+print(f"Sample data shape: {sample_nii.get_fdata().shape}")
+'''
+test_batch = next(iter(train_generator))
+print(f"\nBatch shapes:")
+print(f"MRI: {test_batch[0][0].shape}")
+print(f"PET: {test_batch[0][1].shape}")
+print(f"Labels: {test_batch[1].shape}")
+print(f"Training dataframe size: {len(train_df)}")
+print(f"Expected batches: {len(train_df) // 24}")
+print(f"Actual generator length: {len(train_generator)}")
+
+print(f"Generator batch_size setting: {train_generator.batch_size}")
+print(f"Actual batch shapes from generator:")
+for i, (X, y) in enumerate(train_generator):
+'''
+
+early_stop = EarlyStopping(
+    monitor='val_loss',
+    patience=10,            # stop after 5 epochs of no improvement
+    restore_best_weights=True
+)
+
+# REMOVE the old model.fit() call
+# 
+# model.fit(
+#    train_generator,
+#    steps_per_epoch=5,
+#    validation_data=val_generator,
+#    validation_steps=2,
+#    epochs=5,
+#    callbacks=fast_callbacks,
+#    verbose=1
+#)
+
+# ADD the new, simplified model.fit() call
+
+# Reasoning: When you provide a tf.data.Dataset, TensorFlow automatically knows how many
+# steps are in an epoch. You no longer need to manually specify steps_per_epoch or
+# validation_steps. [cite_start]This is the modern, correct way to use model.fit[cite: 5].
+print("\n=== Starting Model Training ===")
+history = model.fit(
+    train_dataset,
+    validation_data=val_dataset,
+    epochs=30,  # Or your desired number of epochs
+    callbacks=fast_callbacks,
+    verbose=1
+)
+print("\n=== Model Training Complete ===")
+
+# MODIFY the evaluation call to use the new test_dataset
+print("\n=== Final Evaluation on Test Set ===")
+detailed_evaluation(model, test_dataset)
+
+print("\n=== TensorBoard Instructions ===")
+print(f"1. On your local machine, run:")
+print(f"   ssh -L 6006:localhost:6006 your_username@delta.ncsa.illinois.edu")
+print(f"2. On DELTA, run:")
+print(f"   tensorboard --logdir={log_dir} --port=6006")
+print(f"3. Open http://localhost:6006 in your local browser")
+
+def detailed_evaluation(model, dataset):
+    y_true, y_pred = [], []
+    for (X_mri, X_pet), y in dataset:
+        y_true.extend(np.argmax(y, axis=1))
+        predictions = model.predict([X_mri, X_pet], verbose=0)
+        y_pred.extend(np.argmax(predictions, axis=1))
+    
+    print("\nClassification Report:")
+    print(classification_report(
+        y_true, y_pred, 
+        target_names=encoder.categories_[0]
+    ))
+
+detailed_evaluation(model, val_dataset)
+clinical_system = deploy_phase5_system()

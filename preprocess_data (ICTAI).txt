@@ -1,0 +1,157 @@
+# ==============================================================================
+# preprocess_data.py
+#
+# INSTRUCTIONS:
+# 1. Fill in the three paths in the `main()` function below.
+# 2. Run this script from your terminal: python preprocess_data.py
+# 3. This will take a long time to run once, but will make your training
+#    script incredibly fast.
+# ==============================================================================
+
+import os
+import numpy as np
+import pandas as pd
+import nibabel as nib
+from scipy.ndimage import zoom
+from tqdm import tqdm
+
+def preprocess_and_save(image_path, output_path, target_shape=(64, 128, 128)):
+    """Loads a NIfTI image, resizes, normalizes, and saves it as a .npy file."""
+    try:
+        if not os.path.exists(image_path):
+            print(f"Warning: File not found {image_path}. Skipping.")
+            return None
+            
+        nii = nib.load(image_path)
+        data = nii.get_fdata().astype(np.float32)
+
+        if data.ndim == 4:
+            data = data[..., 0]
+
+        zoom_factors = [target_shape[i] / data.shape[i] for i in range(3)]
+        data_resized = zoom(data, zoom_factors, order=3) # Changed to order=3 for consistency
+
+        data_resized = np.nan_to_num(data_resized, nan=0.0, posinf=0.0, neginf=0.0)
+
+        mean = np.mean(data_resized)
+        std = np.std(data_resized)
+        if std > 1e-6:
+            data_norm = (data_resized - mean) / (std + 1e-9)
+        else:
+            data_norm = np.zeros_like(data_resized)
+                # More robust normalization
+        data_resized = np.nan_to_num(data_resized, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        mean = np.mean(data_resized)
+        std = np.std(data_resized)
+        
+        # Add debugging
+        print(f"Processing {os.path.basename(image_path)}: mean={mean:.3f}, std={std:.3f}")
+        
+        if std > 1e-6 and not np.isnan(std) and not np.isinf(std):
+            data_norm = (data_resized - mean) / (std + 1e-9)
+        else:
+            print(f"WARNING: Invalid std ({std}) for {image_path}, using zeros")
+            data_norm = np.zeros_like(data_resized)
+        
+        # Final safety check
+        data_norm = np.nan_to_num(data_norm, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Verify output quality
+        if np.isnan(data_norm).any() or np.isinf(data_norm).any():
+            print(f"ERROR: NaN/Inf found in processed {image_path}")
+            return None
+
+        data_norm = np.expand_dims(data_norm, -1).astype(np.float32)
+        np.save(output_path, data_norm)
+        return output_path
+        
+    except Exception as e:
+        print(f"Error processing {image_path}: {e}")
+        return None
+
+def main():
+    # --- ACTION REQUIRED: FILL IN THESE THREE PATHS ---
+    DF_COMBINED_PATH = "/projects/bcqx/zelghazzali/image/df_combined_original.csv"
+    OUTPUT_DIR_NPY = "/projects/bcqx/zelghazzali/image/preprocessed_npy"
+    FINAL_MANIFEST_CSV_PATH = "/projects/bcqx/zelghazzali/image/df_combined.csv"
+    # --- END OF ACTION REQUIRED ---
+
+    print("--- Starting Offline Pre-processing ---")
+    os.makedirs(OUTPUT_DIR_NPY, exist_ok=True)
+    
+    print(f"Loading combined dataframe from: {DF_COMBINED_PATH}")
+    df_combined = pd.read_csv(DF_COMBINED_PATH)
+    
+    # Filter out rows where original image paths don't exist FIRST
+    initial_count = len(df_combined)
+    df_combined = df_combined[df_combined['Image_Path_MRI'].apply(os.path.exists)]
+    df_combined = df_combined[df_combined['Image_Path_PET'].apply(os.path.exists)]
+    df_combined.reset_index(drop=True, inplace=True)
+    print(f"Filtered out {initial_count - len(df_combined)} samples due to missing source files.")
+    
+    if len(df_combined) == 0:
+        print("ERROR: No valid samples with existing files found. Aborting.")
+        return
+
+    print(f"\nFound {len(df_combined)} valid samples to process.")
+
+    # --- FIX: ADD ROBUST ERROR HANDLING TO THE LOOP ---
+    preprocessed_mri_paths = []
+    preprocessed_pet_paths = []
+    failed_samples = []
+
+    print("\nProcessing MRI and PET files...")
+    for index, row in tqdm(df_combined.iterrows(), total=df_combined.shape[0], desc="Preprocessing"):
+        try:
+            # Process MRI
+            mri_output_path = os.path.join(OUTPUT_DIR_NPY, f"MRI_{row['Subject']}_{row['Visit']}.npy")
+            processed_mri = preprocess_and_save(row['Image_Path_MRI'], mri_output_path)
+            
+            # Process PET
+            pet_output_path = os.path.join(OUTPUT_DIR_NPY, f"PET_{row['Subject']}_{row['Visit']}.npy")
+            processed_pet = preprocess_and_save(row['Image_Path_PET'], pet_output_path)
+            
+            # Only append if both are successful
+            if processed_mri and processed_pet:
+                preprocessed_mri_paths.append(processed_mri)
+                preprocessed_pet_paths.append(processed_pet)
+            else:
+                # Mark as failed if either returns None
+                failed_samples.append(row)
+                preprocessed_mri_paths.append(None)
+                preprocessed_pet_paths.append(None)
+
+        except Exception as e:
+            # Catch unexpected crashes (like the hang you saw)
+            print(f"\nFATAL ERROR on sample index {index}, Subject: {row['Subject']}, Visit: {row['Visit']}.")
+            print(f"  MRI Path: {row['Image_Path_MRI']}")
+            print(f"  PET Path: {row['Image_Path_PET']}")
+            print(f"  Error: {e}")
+            failed_samples.append(row)
+            preprocessed_mri_paths.append(None)
+            preprocessed_pet_paths.append(None)
+            continue # Move to the next sample
+
+    # Assign the lists of new paths to the dataframe columns
+    df_combined['Preprocessed_Path_MRI'] = preprocessed_mri_paths
+    df_combined['Preprocessed_Path_PET'] = preprocessed_pet_paths
+    # --- END OF FIX ---
+    
+    # Drop all rows where preprocessing failed (where paths are None)
+    original_rows = len(df_combined)
+    df_combined.dropna(subset=['Preprocessed_Path_MRI', 'Preprocessed_Path_PET'], inplace=True)
+    final_rows = len(df_combined)
+    
+    print("\n--- Pre-processing Summary ---")
+    if failed_samples:
+        print(f"Identified {len(failed_samples)} corrupted or problematic samples. These have been excluded.")
+    print(f"Successfully processed {final_rows} samples.")
+    print(f"Dropped {original_rows - final_rows} samples due to errors.")
+    
+    print(f"\nSaving final manifest with preprocessed paths to: {FINAL_MANIFEST_CSV_PATH}")
+    df_combined.to_csv(FINAL_MANIFEST_CSV_PATH, index=False)
+    print(f"--- Offline Pre-processing Complete ---")
+
+if __name__ == '__main__':
+    main()
